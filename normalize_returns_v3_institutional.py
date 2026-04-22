@@ -128,6 +128,17 @@ def normalize_columns(
     base_cols: List[str],
     cfg: PipelineConfig,
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], pd.Series]:
+    required_runtime_cols = {"in_universe", "date", "sector"}
+    missing_runtime = sorted(required_runtime_cols - set(df.columns))
+    if missing_runtime:
+        fail(f"normalize_columns missing required columns: {missing_runtime}")
+    if not base_cols:
+        fail("normalize_columns received empty base_cols; no trailing features were generated.")
+
+    missing_base = sorted([c for c in base_cols if c not in df.columns])
+    if missing_base:
+        fail(f"normalize_columns missing base feature columns: {missing_base}")
+
     sector_key = df["sector"].astype("string").str.strip()
     sector_key = sector_key.where(sector_key.notna() & (sector_key != ""), pd.NA)
 
@@ -187,8 +198,8 @@ def run_quality_gates(
 ) -> None:
     failures: List[str] = []
 
-    universe_cov = float(audit["universe_coverage_pct"])
-    sector_cov = float(audit["sector_coverage_in_universe_pct"])
+    universe_cov = float(audit.get("universe_coverage_pct", 0.0))
+    sector_cov = float(audit.get("sector_coverage_in_universe_pct", 0.0))
 
     if universe_cov < cfg.min_universe_coverage_pct:
         failures.append(
@@ -200,7 +211,7 @@ def run_quality_gates(
             f"{sector_cov:.2f}% < min_sector_coverage_in_universe_pct={cfg.min_sector_coverage_in_universe_pct:.2f}%"
         )
 
-    per_col = audit["per_column"]
+    per_col = audit.get("per_column", {})
     for col in base_cols:
         stats = per_col.get(col)
         if not stats or stats["z_nan_rate"] is None:
@@ -312,6 +323,8 @@ def main() -> None:
     for h in cfg.trailing_horizons:
         raw_col = f"ret_{h}d"
         voladj_col = f"ret_{h}d_voladj"
+        if "vol_22d" not in df.columns:
+            fail("vol_22d was not computed before vol-adjusted return generation.")
         scale = df["vol_22d"] * np.sqrt(h)
         df[voladj_col] = (df[raw_col] / scale.where(scale > 0)).astype(np.float32)
         base_cols.extend([raw_col, voladj_col])

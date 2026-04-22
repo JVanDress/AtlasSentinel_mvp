@@ -71,6 +71,12 @@ def pct(numerator: int, denominator: int) -> float:
     return 100.0 * float(numerator) / float(denominator)
 
 
+def safe_stat(value: float) -> float:
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
 def validate_schema(df: pd.DataFrame) -> None:
     required = {"ticker", "date", "close", "volume", "sector"}
     missing = sorted(required - set(df.columns))
@@ -162,11 +168,11 @@ def normalize_columns(
 
         audit_cols[col] = {
             "n_valid": n_valid,
-            "z_mean": float(z.mean(skipna=True)),
-            "z_std": float(z.std(skipna=True)),
+            "z_mean": safe_stat(z.mean(skipna=True)),
+            "z_std": safe_stat(z.std(skipna=True)),
             "z_nan_rate": float(z.isna().mean()),
-            "pct_min": float(p.min(skipna=True)),
-            "pct_max": float(p.max(skipna=True)),
+            "pct_min": safe_stat(p.min(skipna=True)),
+            "pct_max": safe_stat(p.max(skipna=True)),
             "pct_nan_rate": float(p.isna().mean()),
         }
 
@@ -313,7 +319,9 @@ def main() -> None:
     # Cross-sectional normalization
     df, audit_cols, universe_mask = normalize_columns(df, base_cols, cfg)
 
-    grp_sizes = df.loc[universe_mask].groupby(["date", "sector"]).size()
+    sector_key = df["sector"].astype("string").str.strip()
+    sector_key = sector_key.where(sector_key.notna() & (sector_key != ""), pd.NA)
+    grp_sizes = df.loc[universe_mask].groupby([df.loc[universe_mask, "date"], sector_key.loc[universe_mask]]).size()
     audit_group_sizes = {
         "n_groups": int(len(grp_sizes)),
         "min": int(grp_sizes.min()) if len(grp_sizes) else None,

@@ -23,7 +23,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,7 +37,7 @@ class PipelineConfig:
 
     # Universe filters
     min_price: float = 10.0
-    min_adv_dollar: float = 3_000_000.0
+    min_adv_dollar: float = 1_000_000.0
     adv_window: int = 22
 
     # Eligibility history
@@ -71,7 +71,7 @@ def pct(numerator: int, denominator: int) -> float:
     return 100.0 * float(numerator) / float(denominator)
 
 
-def safe_stat(value: float) -> float:
+def safe_stat(value: float) -> Optional[float]:
     if pd.isna(value):
         return None
     return float(value)
@@ -101,25 +101,25 @@ def validate_numeric_inputs(df: pd.DataFrame) -> None:
         fail(f"'volume' must be >= 0; found {negative_volume:,} rows")
 
 
-def winsorize_group(series: pd.Series, date: pd.Series, sector: pd.Series, k: float) -> pd.Series:
-    med = series.groupby([date, sector]).transform("median")
-    mad = (series - med).abs().groupby([date, sector]).transform("median")
+def winsorize_group(tmp: pd.DataFrame, value_col: str, k: float) -> pd.Series:
+    med = tmp.groupby(["date", "sector"], sort=False)[value_col].transform("median")
+    mad = (tmp[value_col] - med).abs().groupby([tmp["date"], tmp["sector"]]).transform("median")
     lo = med - k * mad
     hi = med + k * mad
-    return series.clip(lower=lo, upper=hi)
+    return tmp[value_col].clip(lower=lo, upper=hi)
 
 
-def zscore_group(series: pd.Series, date: pd.Series, sector: pd.Series, min_count: int) -> pd.Series:
-    mean = series.groupby([date, sector]).transform("mean")
-    std = series.groupby([date, sector]).transform("std")
-    count = series.groupby([date, sector]).transform("count")
-    z = (series - mean) / std.where(std > 0)
+def zscore_group(tmp: pd.DataFrame, value_col: str, min_count: int) -> pd.Series:
+    mean = tmp.groupby(["date", "sector"], sort=False)[value_col].transform("mean")
+    std = tmp.groupby(["date", "sector"], sort=False)[value_col].transform("std")
+    count = tmp.groupby(["date", "sector"], sort=False)[value_col].transform("count")
+    z = (tmp[value_col] - mean) / std.where(std > 0)
     return z.where(count >= min_count)
 
 
-def pctrank_group(series: pd.Series, date: pd.Series, sector: pd.Series, min_count: int) -> pd.Series:
-    rank = series.groupby([date, sector]).rank(pct=True)
-    count = series.groupby([date, sector]).transform("count")
+def pctrank_group(tmp: pd.DataFrame, value_col: str, min_count: int) -> pd.Series:
+    rank = tmp.groupby(["date", "sector"], sort=False)[value_col].rank(pct=True)
+    count = tmp.groupby(["date", "sector"], sort=False)[value_col].transform("count")
     return rank.where(count >= min_count)
 
 
@@ -127,7 +127,7 @@ def normalize_columns(
     df: pd.DataFrame,
     base_cols: List[str],
     cfg: PipelineConfig,
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], pd.Series]:
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Optional[float]]], pd.Series, pd.Series]:
     required_runtime_cols = {"in_universe", "date", "sector"}
     missing_runtime = sorted(required_runtime_cols - set(df.columns))
     if missing_runtime:
@@ -143,7 +143,7 @@ def normalize_columns(
     sector_key = sector_key.where(sector_key.notna() & (sector_key != ""), pd.NA)
 
     universe_mask = df["in_universe"] & sector_key.notna()
-    audit_cols: Dict[str, Dict[str, float]] = {}
+    audit_cols: Dict[str, Dict[str, Optional[float]]] = {}
 
     for col in base_cols:
         z_col = f"{col}_zscore"
@@ -166,16 +166,20 @@ def normalize_columns(
             }
             continue
 
-        s = df.loc[valid, col].astype(np.float64)
-        d = df.loc[valid, "date"]
-        sec = sector_key.loc[valid]
+        tmp = df.loc[valid, ["date", col]].copy()
+        tmp["sector"] = sector_key.loc[valid].astype("string")
+        tmp[col] = tmp[col].astype(np.float64)
 
-        s_wins = winsorize_group(s, d, sec, k=cfg.winsorize_mad_k)
-        z = zscore_group(s_wins, d, sec, min_count=cfg.norm_min_stocks)
-        p = pctrank_group(s, d, sec, min_count=cfg.norm_min_stocks)
+        tmp[col] = winsorize_group(tmp, value_col=col, k=cfg.winsorize_mad_k)
+        z = zscore_group(tmp, value_col=col, min_count=cfg.norm_min_stocks)
 
-        df.loc[valid, z_col] = z.astype(np.float32)
-        df.loc[valid, p_col] = p.astype(np.float32)
+        rank_tmp = df.loc[valid, ["date", col]].copy()
+        rank_tmp["sector"] = sector_key.loc[valid].astype("string")
+        rank_tmp[col] = rank_tmp[col].astype(np.float64)
+        p = pctrank_group(rank_tmp, value_col=col, min_count=cfg.norm_min_stocks)
+
+        df.loc[tmp.index, z_col] = z.astype(np.float32)
+        df.loc[rank_tmp.index, p_col] = p.astype(np.float32)
 
         audit_cols[col] = {
             "n_valid": n_valid,
@@ -187,7 +191,7 @@ def normalize_columns(
             "pct_nan_rate": float(p.isna().mean()),
         }
 
-    return df, audit_cols, universe_mask
+    return df, audit_cols, universe_mask, sector_key
 
 
 def run_quality_gates(
@@ -247,6 +251,12 @@ def main() -> None:
         action="store_true",
         help="Do not fail the run when quality gates are breached.",
     )
+    parser.add_argument(
+        "--min-adv-dollar",
+        type=float,
+        default=None,
+        help="Override minimum lagged dollar ADV required for universe inclusion.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -256,6 +266,10 @@ def main() -> None:
     print(f"Reading: {input_path}")
     df = pd.read_parquet(input_path)
     cfg = PipelineConfig()
+    if args.min_adv_dollar is not None:
+        if args.min_adv_dollar <= 0:
+            fail("--min-adv-dollar must be > 0")
+        cfg.min_adv_dollar = float(args.min_adv_dollar)
 
     validate_schema(df)
 
@@ -330,10 +344,7 @@ def main() -> None:
         base_cols.extend([raw_col, voladj_col])
 
     # Cross-sectional normalization
-    df, audit_cols, universe_mask = normalize_columns(df, base_cols, cfg)
-
-    sector_key = df["sector"].astype("string").str.strip()
-    sector_key = sector_key.where(sector_key.notna() & (sector_key != ""), pd.NA)
+    df, audit_cols, universe_mask, sector_key = normalize_columns(df, base_cols, cfg)
     grp_sizes = df.loc[universe_mask].groupby([df.loc[universe_mask, "date"], sector_key.loc[universe_mask]]).size()
     audit_group_sizes = {
         "n_groups": int(len(grp_sizes)),

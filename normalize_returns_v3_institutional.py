@@ -32,13 +32,7 @@ import pandas as pd
 @dataclass
 class PipelineConfig:
     # Lag conventions
-    filter_lag: int = 2
     conditioning_lag: int = 2
-
-    # Universe filters
-    min_price: float = 10.0
-    min_adv_dollar: float = 1_000_000.0
-    adv_window: int = 22
 
     # Eligibility history
     min_history_days: int = 60
@@ -78,7 +72,7 @@ def safe_stat(value: float) -> Optional[float]:
 
 
 def validate_schema(df: pd.DataFrame) -> None:
-    required = {"ticker", "date", "close", "volume", "sector"}
+    required = {"ticker", "date", "close", "sector"}
     missing = sorted(required - set(df.columns))
     if missing:
         fail(f"Missing required columns: {missing}")
@@ -87,7 +81,6 @@ def validate_schema(df: pd.DataFrame) -> None:
 def validate_numeric_inputs(df: pd.DataFrame) -> None:
     # Convert to numeric first to make checks deterministic.
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
     if df["close"].isna().any():
         fail(f"'close' contains non-numeric or missing values: {int(df['close'].isna().sum()):,} rows")
@@ -96,9 +89,26 @@ def validate_numeric_inputs(df: pd.DataFrame) -> None:
     if non_positive_close:
         fail(f"'close' must be > 0 for log returns; found {non_positive_close:,} rows")
 
-    negative_volume = int((df["volume"] < 0).sum(skipna=True))
-    if negative_volume:
-        fail(f"'volume' must be >= 0; found {negative_volume:,} rows")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        negative_volume = int((df["volume"] < 0).sum(skipna=True))
+        if negative_volume:
+            fail(f"'volume' must be >= 0; found {negative_volume:,} rows")
+
+
+def coerce_bool_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False).astype(bool)
+
+    normalized = series.astype("string").str.strip().str.lower()
+    out = pd.Series(False, index=series.index, dtype=bool)
+    out.loc[normalized.isin(["1", "true", "t", "yes", "y"])] = True
+    out.loc[normalized.isin(["0", "false", "f", "no", "n", ""])] = False
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    out.loc[numeric == 1] = True
+    out.loc[numeric == 0] = False
+    return out
 
 
 def winsorize_group(tmp: pd.DataFrame, value_col: str, k: float) -> pd.Series:
@@ -255,12 +265,6 @@ def main() -> None:
         action="store_true",
         help="Do not fail the run when quality gates are breached.",
     )
-    parser.add_argument(
-        "--min-adv-dollar",
-        type=float,
-        default=None,
-        help="Override minimum lagged dollar ADV required for universe inclusion.",
-    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -270,10 +274,6 @@ def main() -> None:
     print(f"Reading: {input_path}")
     df = pd.read_parquet(input_path)
     cfg = PipelineConfig()
-    if args.min_adv_dollar is not None:
-        if args.min_adv_dollar <= 0:
-            fail("--min-adv-dollar must be > 0")
-        cfg.min_adv_dollar = float(args.min_adv_dollar)
 
     validate_schema(df)
 
@@ -293,16 +293,6 @@ def main() -> None:
     if n_rows:
         print(f"Date range: {df['date'].min().date()} -> {df['date'].max().date()}")
 
-    # Lagged filter/conditioning fields
-    df["price_lag"] = df.groupby("ticker")["close"].shift(cfg.filter_lag)
-    close_cond_lag = df.groupby("ticker")["close"].shift(cfg.conditioning_lag)
-    vol_cond_lag = df.groupby("ticker")["volume"].shift(cfg.conditioning_lag)
-
-    df["dollar_volume_lag"] = close_cond_lag * vol_cond_lag
-    df["adv_22d"] = df.groupby("ticker")["dollar_volume_lag"].transform(
-        lambda x: x.rolling(cfg.adv_window, min_periods=10).mean()
-    )
-
     # Volatility from lagged daily log returns
     log_close_f64 = np.log(df["close"].astype(np.float64))
     daily_ret = log_close_f64.groupby(df["ticker"]).diff()
@@ -312,17 +302,22 @@ def main() -> None:
     )
     df["vol_22d"] = df["vol_22d"].clip(lower=cfg.vol_floor)
 
-    clean = (~df["price_lag"].isna()) & (~df["adv_22d"].isna()) & (~df["vol_22d"].isna())
-    df["has_min_history"] = clean.groupby(df["ticker"]).cumsum() >= cfg.min_history_days
+    df["history_days"] = df.groupby("ticker").cumcount() + 1
+    df["has_min_history"] = df["history_days"] >= cfg.min_history_days
 
-    df["in_universe"] = (
-        (df["price_lag"] >= cfg.min_price)
-        & (df["adv_22d"] >= cfg.min_adv_dollar)
-        & df["has_min_history"]
-    ).fillna(False)
+    if "in_universe" in df.columns:
+        input_universe = coerce_bool_series(df["in_universe"])
+        df["in_universe"] = input_universe & df["has_min_history"]
+        universe_source = "input_in_universe_and_min_history"
+    else:
+        df["in_universe"] = df["has_min_history"]
+        universe_source = "min_history_only"
 
     universe_rows = int(df["in_universe"].sum())
-    print(f"In-universe rows: {universe_rows:,} ({pct(universe_rows, n_rows):.2f}%)")
+    print(
+        f"In-universe rows: {universe_rows:,} ({pct(universe_rows, n_rows):.2f}%) "
+        f"[source={universe_source}]"
+    )
 
     # Returns
     g = log_close_f64.groupby(df["ticker"])
@@ -373,6 +368,7 @@ def main() -> None:
         "date_min": str(df["date"].min().date()) if n_rows else None,
         "date_max": str(df["date"].max().date()) if n_rows else None,
         "n_in_universe": universe_rows,
+        "universe_source": universe_source,
         "universe_coverage_pct": round(pct(universe_rows, n_rows), 4),
         "n_with_sector_in_universe": sector_covered_rows,
         "sector_coverage_in_universe_pct": round(pct(sector_covered_rows, universe_rows), 4),

@@ -78,22 +78,29 @@ def validate_schema(df: pd.DataFrame) -> None:
         fail(f"Missing required columns: {missing}")
 
 
-def validate_numeric_inputs(df: pd.DataFrame) -> None:
+def validate_numeric_inputs(df: pd.DataFrame, bad_close_policy: str) -> Tuple[pd.DataFrame, int, int]:
     # Convert to numeric first to make checks deterministic.
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    invalid_close = df["close"].isna() | (df["close"] <= 0)
+    n_invalid_close = int(invalid_close.sum())
+    n_dropped_close = 0
 
-    if df["close"].isna().any():
-        fail(f"'close' contains non-numeric or missing values: {int(df['close'].isna().sum()):,} rows")
-
-    non_positive_close = int((df["close"] <= 0).sum())
-    if non_positive_close:
-        fail(f"'close' must be > 0 for log returns; found {non_positive_close:,} rows")
+    if n_invalid_close:
+        if bad_close_policy == "fail":
+            fail(f"'close' must be numeric and > 0 for log returns; found {n_invalid_close:,} bad rows")
+        if bad_close_policy == "drop":
+            df = df.loc[~invalid_close].copy()
+            n_dropped_close = n_invalid_close
+        elif bad_close_policy == "null":
+            df.loc[invalid_close, "close"] = np.nan
 
     if "volume" in df.columns:
         df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
         negative_volume = int((df["volume"] < 0).sum(skipna=True))
         if negative_volume:
             fail(f"'volume' must be >= 0; found {negative_volume:,} rows")
+
+    return df, n_invalid_close, n_dropped_close
 
 
 def coerce_bool_series(series: pd.Series) -> pd.Series:
@@ -265,6 +272,12 @@ def main() -> None:
         action="store_true",
         help="Do not fail the run when quality gates are breached.",
     )
+    parser.add_argument(
+        "--bad-close-policy",
+        choices=["fail", "drop", "null"],
+        default="null",
+        help="How to handle bad close rows (non-numeric, missing, <=0): fail | drop | null (default: null).",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -274,6 +287,7 @@ def main() -> None:
     print(f"Reading: {input_path}")
     df = pd.read_parquet(input_path)
     cfg = PipelineConfig()
+    n_input_rows_raw = len(df)
 
     validate_schema(df)
 
@@ -282,7 +296,14 @@ def main() -> None:
     if df["date"].isna().any():
         fail(f"Invalid dates found: {int(df['date'].isna().sum()):,} rows")
 
-    validate_numeric_inputs(df)
+    df, n_invalid_close_rows, n_dropped_close_rows = validate_numeric_inputs(
+        df, bad_close_policy=args.bad_close_policy
+    )
+    if n_invalid_close_rows:
+        print(
+            f"WARNING: detected {n_invalid_close_rows:,} bad close rows; "
+            f"policy={args.bad_close_policy} dropped={n_dropped_close_rows:,}."
+        )
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
     if df.duplicated(subset=["ticker", "date"]).any():
@@ -302,15 +323,16 @@ def main() -> None:
     )
     df["vol_22d"] = df["vol_22d"].clip(lower=cfg.vol_floor)
 
-    df["history_days"] = df.groupby("ticker").cumcount() + 1
+    df["valid_close"] = df["close"].notna()
+    df["history_days"] = df.groupby("ticker")["valid_close"].cumsum()
     df["has_min_history"] = df["history_days"] >= cfg.min_history_days
 
     if "in_universe" in df.columns:
         input_universe = coerce_bool_series(df["in_universe"])
-        df["in_universe"] = input_universe & df["has_min_history"]
+        df["in_universe"] = input_universe & df["has_min_history"] & df["valid_close"]
         universe_source = "input_in_universe_and_min_history"
     else:
-        df["in_universe"] = df["has_min_history"]
+        df["in_universe"] = df["has_min_history"] & df["valid_close"]
         universe_source = "min_history_only"
 
     universe_rows = int(df["in_universe"].sum())
@@ -361,12 +383,16 @@ def main() -> None:
     audit: Dict[str, object] = {
         "input_path": str(input_path),
         "config": asdict(cfg),
-        "n_input_rows": n_rows,
+        "n_input_rows_raw": n_input_rows_raw,
+        "n_input_rows_after_bad_close_policy": n_rows,
         "n_output_rows": len(df),
         "n_tickers": int(df["ticker"].nunique()),
         "n_dates": int(df["date"].nunique()),
         "date_min": str(df["date"].min().date()) if n_rows else None,
         "date_max": str(df["date"].max().date()) if n_rows else None,
+        "bad_close_policy": args.bad_close_policy,
+        "n_bad_close_rows_detected": n_invalid_close_rows,
+        "n_bad_close_rows_dropped": n_dropped_close_rows,
         "n_in_universe": universe_rows,
         "universe_source": universe_source,
         "universe_coverage_pct": round(pct(universe_rows, n_rows), 4),

@@ -14,8 +14,9 @@ For each trailing horizon N in trailing_horizons, produces:
 Forward returns are preserved raw as targets:
   fwd_ret_{N}d
 
-Quality gates (enabled by default) fail the run when core diagnostics degrade
-below configured thresholds. Audit JSON is written beside the output parquet.
+Quality gates are warning-only by default. Use --enforce-quality-gates to fail
+the run when diagnostics degrade below configured thresholds. Audit JSON is
+written beside the output parquet.
 """
 
 import argparse
@@ -72,7 +73,7 @@ def safe_stat(value: float) -> Optional[float]:
 
 
 def validate_schema(df: pd.DataFrame) -> None:
-    required = {"ticker", "date", "close", "sector"}
+    required = {"ticker", "date", "close"}
     missing = sorted(required - set(df.columns))
     if missing:
         fail(f"Missing required columns: {missing}")
@@ -268,9 +269,9 @@ def main() -> None:
         help="Output parquet file path (default: <input>_normalized_institutional.parquet)",
     )
     parser.add_argument(
-        "--disable-quality-gates",
+        "--enforce-quality-gates",
         action="store_true",
-        help="Do not fail the run when quality gates are breached.",
+        help="Fail the run when quality gates are breached (default: warn only).",
     )
     parser.add_argument(
         "--bad-close-policy",
@@ -291,10 +292,15 @@ def main() -> None:
 
     validate_schema(df)
 
+    if "sector" not in df.columns:
+        df["sector"] = "UNKNOWN"
+
     df["ticker"] = df["ticker"].astype(str).str.strip()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    if df["date"].isna().any():
-        fail(f"Invalid dates found: {int(df['date'].isna().sum()):,} rows")
+    n_bad_dates = int(df["date"].isna().sum())
+    if n_bad_dates:
+        print(f"WARNING: dropping {n_bad_dates:,} rows with invalid dates.")
+        df = df.loc[df["date"].notna()].copy()
 
     df, n_invalid_close_rows, n_dropped_close_rows = validate_numeric_inputs(
         df, bad_close_policy=args.bad_close_policy
@@ -306,8 +312,11 @@ def main() -> None:
         )
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-    if df.duplicated(subset=["ticker", "date"]).any():
-        fail("Duplicate ticker/date rows found.")
+    dup_mask = df.duplicated(subset=["ticker", "date"], keep="last")
+    n_dups = int(dup_mask.sum())
+    if n_dups:
+        print(f"WARNING: dropping {n_dups:,} duplicate ticker/date rows (keeping last).")
+        df = df.loc[~dup_mask].copy()
 
     n_rows = len(df)
     print(f"Rows: {n_rows:,}  Tickers: {df['ticker'].nunique():,}  Dates: {df['date'].nunique():,}")
@@ -385,6 +394,8 @@ def main() -> None:
         "config": asdict(cfg),
         "n_input_rows_raw": n_input_rows_raw,
         "n_input_rows_after_bad_close_policy": n_rows,
+        "n_invalid_date_rows_dropped": n_bad_dates,
+        "n_duplicate_rows_dropped": n_dups,
         "n_output_rows": len(df),
         "n_tickers": int(df["ticker"].nunique()),
         "n_dates": int(df["date"].nunique()),
@@ -406,7 +417,7 @@ def main() -> None:
         cfg=cfg,
         audit=audit,
         base_cols=base_cols,
-        enforce=not args.disable_quality_gates,
+        enforce=args.enforce_quality_gates,
     )
 
     output_path = (

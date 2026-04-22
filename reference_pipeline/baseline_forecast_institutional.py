@@ -437,6 +437,53 @@ def summarize_fold_metrics(fold_metrics: pd.DataFrame) -> Dict[str, Dict[str, fl
     return out
 
 
+def append_experiment_registry(
+    output_dir: Path,
+    summary: Dict[str, object],
+    args: argparse.Namespace,
+) -> Path:
+    registry_path = output_dir / "experiment_registry.csv"
+    horizon_summary: Dict[str, Dict[str, float]] = summary.get("horizon_summary", {})
+
+    row: Dict[str, object] = {
+        "run_timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+        "input_path": summary.get("input_path"),
+        "output_dir": summary.get("output_dir"),
+        "elapsed_seconds": summary.get("elapsed_seconds"),
+        "n_rows_used": summary.get("n_rows_used"),
+        "n_features": summary.get("n_features"),
+        "universe_source": summary.get("universe_source"),
+        "horizons": ",".join(str(h) for h in summary.get("config", {}).get("horizons", [])),
+        "feature_mode": summary.get("config", {}).get("feature_mode"),
+        "include_prefixes": ",".join(args.include_prefix),
+        "exclude_prefixes": ",".join(args.exclude_prefix),
+        "cost_bps": summary.get("config", {}).get("cost_bps"),
+        "ridge_alpha": summary.get("config", {}).get("ridge_alpha"),
+        "n_splits": summary.get("config", {}).get("n_splits"),
+        "min_feature_completeness": summary.get("config", {}).get("min_feature_completeness"),
+        "purge_days_override": summary.get("config", {}).get("purge_days_override"),
+    }
+
+    for horizon_key, metrics in horizon_summary.items():
+        row[f"h{horizon_key}_folds"] = metrics.get("folds")
+        row[f"h{horizon_key}_ic"] = metrics.get("spearman_ic_mean")
+        row[f"h{horizon_key}_spread_gross"] = metrics.get("decile_spread_gross_mean")
+        row[f"h{horizon_key}_spread_net"] = metrics.get("decile_spread_net_mean")
+        row[f"h{horizon_key}_turnover"] = metrics.get("turnover_mean")
+        row[f"h{horizon_key}_mdd"] = metrics.get("max_drawdown_unitless_worst")
+        row[f"h{horizon_key}_hit_rate"] = metrics.get("hit_rate_mean")
+        row[f"h{horizon_key}_rmse"] = metrics.get("rmse_mean")
+
+    row_df = pd.DataFrame([row])
+    if registry_path.exists():
+        existing = pd.read_csv(registry_path)
+        out_df = pd.concat([existing, row_df], ignore_index=True)
+    else:
+        out_df = row_df
+    out_df.to_csv(registry_path, index=False)
+    return registry_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Forecast baseline (institutional)")
     parser.add_argument("-i", "--input", required=True, help="Normalized parquet input file")
@@ -634,9 +681,15 @@ def main() -> None:
             output_dir / "feature_importance.csv", index=False
         )
 
+    registry_path = append_experiment_registry(output_dir=output_dir, summary=summary, args=args)
+
     print("\nBaseline forecasting complete.")
     print(f"Output directory: {output_dir}")
-    print("Wrote: metrics_summary.json, fold_metrics.csv, daily_ic.csv, predictions.parquet, feature_importance.csv")
+    print(
+        "Wrote: metrics_summary.json, fold_metrics.csv, daily_ic.csv, "
+        "predictions.parquet, feature_importance.csv, experiment_registry.csv"
+    )
+    print(f"Registry: {registry_path}")
 
 
 if __name__ == "__main__":

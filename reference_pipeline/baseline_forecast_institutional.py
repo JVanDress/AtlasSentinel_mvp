@@ -73,7 +73,7 @@ class BaselineConfig:
     n_deciles: int = 10
     ridge_alpha: float = 1.0
     cost_bps: float = 10.0
-    feature_mode: str = "all"
+    feature_mode: str = "all_numeric"
     purge_days_override: int = -1
     max_abs_weight_z: float = 3.0
 
@@ -111,8 +111,28 @@ def build_feature_set(
 
     if feature_mode == "core":
         selected = [c for c in core_candidates if c in df.columns]
-    else:
+    elif feature_mode in {"normalized", "all"}:
         selected = list(normalized)
+    else:
+        # Full-system mode: include all numeric lagged features, excluding obvious
+        # identifiers and target/leakage columns.
+        numeric_cols = set(df.select_dtypes(include=[np.number]).columns)
+        selected = []
+        for col in sorted(numeric_cols):
+            if col in protected:
+                continue
+            if col.startswith("fwd_") or col.startswith("y_"):
+                continue
+            if col in {
+                "pred",
+                "target",
+                "fold",
+                "horizon",
+            }:
+                continue
+            if "target" in col.lower() or "label" in col.lower() or "future" in col.lower():
+                continue
+            selected.append(col)
 
     # Optional family inclusion by prefix (useful for overlays that are numeric
     # but may not follow _zscore/_pctrank naming conventions).
@@ -274,6 +294,105 @@ def compute_drawdown_from_log_returns(log_returns: pd.Series) -> float:
     return float(dd.min())
 
 
+def horizon_non_overlapping_backtest(
+    weights_df: pd.DataFrame,
+    horizon: int,
+    cost_bps: float,
+) -> Dict[str, float]:
+    """
+    Horizon-aligned return diagnostics using non-overlapping cohorts.
+
+    We evaluate portfolio event returns at rebalance dates using fwd_ret_{h}d
+    targets and sample every `horizon`th rebalance to avoid overlap leakage in
+    the reported return path.
+    """
+    if weights_df.empty:
+        return {
+            "cohorts_used": 0,
+            "turnover_mean": np.nan,
+            "cost_drag": np.nan,
+            "event_return_gross_mean": np.nan,
+            "event_return_net_mean": np.nan,
+            "return_gross_annualized": np.nan,
+            "return_net_annualized": np.nan,
+            "max_drawdown_worst": np.nan,
+        }
+
+    per_date = (
+        weights_df.groupby("date", sort=True)
+        .apply(lambda g: float(np.sum(g["weight"].values * g["target"].values)))
+        .rename("event_return")
+    )
+    if per_date.empty:
+        return {
+            "cohorts_used": 0,
+            "turnover_mean": np.nan,
+            "cost_drag": np.nan,
+            "event_return_gross_mean": np.nan,
+            "event_return_net_mean": np.nan,
+            "return_gross_annualized": np.nan,
+            "return_net_annualized": np.nan,
+            "max_drawdown_worst": np.nan,
+        }
+
+    ann_factor = 252.0 / float(horizon)
+    max_offsets = min(horizon, len(per_date))
+
+    gross_events: List[float] = []
+    net_events: List[float] = []
+    gross_annualized: List[float] = []
+    net_annualized: List[float] = []
+    mdds: List[float] = []
+    turnovers: List[float] = []
+
+    for offset in range(max_offsets):
+        cohort = per_date.iloc[offset::horizon]
+        if len(cohort) == 0:
+            continue
+
+        cohort_dates = set(cohort.index.tolist())
+        cohort_weights = weights_df[weights_df["date"].isin(cohort_dates)].copy()
+        cohort_turnover_mean, _ = compute_turnover(cohort_weights)
+        if np.isnan(cohort_turnover_mean):
+            continue
+
+        cost_drag = (cost_bps / 10_000.0) * cohort_turnover_mean
+        gross_mean = float(cohort.mean())
+        net_mean = gross_mean - cost_drag
+
+        gross_events.append(gross_mean)
+        net_events.append(net_mean)
+        gross_annualized.append(gross_mean * ann_factor)
+        net_annualized.append(net_mean * ann_factor)
+        turnovers.append(float(cohort_turnover_mean))
+        mdds.append(compute_drawdown_from_log_returns(cohort))
+
+    if not gross_events:
+        return {
+            "cohorts_used": 0,
+            "turnover_mean": np.nan,
+            "cost_drag": np.nan,
+            "event_return_gross_mean": np.nan,
+            "event_return_net_mean": np.nan,
+            "return_gross_annualized": np.nan,
+            "return_net_annualized": np.nan,
+            "max_drawdown_worst": np.nan,
+        }
+
+    out_turnover = float(np.mean(turnovers))
+    out_cost_drag = (cost_bps / 10_000.0) * out_turnover
+    return {
+        "cohorts_used": int(len(gross_events)),
+        "turnover_mean": out_turnover,
+        "cost_drag": float(out_cost_drag),
+        "event_return_gross_mean": float(np.mean(gross_events)),
+        "event_return_net_mean": float(np.mean(net_events)),
+        "return_gross_annualized": float(np.mean(gross_annualized)),
+        "return_net_annualized": float(np.mean(net_annualized)),
+        "max_drawdown_worst": float(np.min(mdds)),
+    }
+
+
 def feature_completeness_filter(
     df: pd.DataFrame,
     features: Sequence[str],
@@ -367,17 +486,22 @@ def train_and_evaluate_horizon(
             min_names_per_day=cfg.min_names_per_day,
             max_abs_weight_z=cfg.max_abs_weight_z,
         )
-        turnover_mean, turnover_df = compute_turnover(weights_df)
-        cost_drag = (cfg.cost_bps / 10_000.0) * turnover_mean if not np.isnan(turnover_mean) else np.nan
+        turnover_mean_daily, turnover_df = compute_turnover(weights_df)
+        cost_drag = (
+            (cfg.cost_bps / 10_000.0) * turnover_mean_daily
+            if not np.isnan(turnover_mean_daily)
+            else np.nan
+        )
         spread_net = spread_gross - cost_drag if not np.isnan(spread_gross) and not np.isnan(cost_drag) else np.nan
 
-        if weights_df.empty:
-            portfolio_daily = pd.Series(dtype=float)
-        else:
-            portfolio_daily = weights_df.groupby("date")["target"].apply(
-                lambda s: float(np.sum(s.values * weights_df.loc[s.index, "weight"].values))
-            )
-        max_dd = compute_drawdown_from_log_returns(portfolio_daily)
+        # Proper return diagnostics for horizon forecasts: non-overlapping cohorts.
+        bt = horizon_non_overlapping_backtest(
+            weights_df=weights_df,
+            horizon=horizon,
+            cost_bps=cfg.cost_bps,
+        )
+        turnover_mean = bt["turnover_mean"]
+        max_dd = bt["max_drawdown_worst"]
 
         fold_summaries.append(
             {
@@ -397,15 +521,21 @@ def train_and_evaluate_horizon(
                 "pearson_ic_mean": float(ic_df["pearson_ic"].mean()) if not ic_df.empty else np.nan,
                 "decile_spread_gross": spread_gross,
                 "turnover_mean": turnover_mean,
-                "cost_drag_from_turnover": cost_drag,
+                "cost_drag_from_turnover": bt["cost_drag"],
                 "decile_spread_net": spread_net,
                 "max_drawdown_unitless": max_dd,
+                "event_return_gross_mean": bt["event_return_gross_mean"],
+                "event_return_net_mean": bt["event_return_net_mean"],
+                "return_gross_annualized": bt["return_gross_annualized"],
+                "return_net_annualized": bt["return_net_annualized"],
+                "cohorts_used": bt["cohorts_used"],
             }
         )
 
         pred_df = pred_df.merge(ic_df[["date", "spearman_ic", "pearson_ic"]], on="date", how="left")
+        pred_df["turnover"] = np.nan
         if not turnover_df.empty:
-            pred_df = pred_df.merge(turnover_df, on="date", how="left")
+            pred_df = pred_df.drop(columns=["turnover"]).merge(turnover_df, on="date", how="left")
         fold_predictions.append(pred_df)
 
         ridge = model.named_steps["ridge"]
@@ -432,6 +562,8 @@ def summarize_fold_metrics(fold_metrics: pd.DataFrame) -> Dict[str, Dict[str, fl
             "decile_spread_gross_mean": float(g["decile_spread_gross"].mean()),
             "decile_spread_net_mean": float(g["decile_spread_net"].mean()),
             "turnover_mean": float(g["turnover_mean"].mean()),
+            "return_gross_annualized_mean": float(g["return_gross_annualized"].mean()),
+            "return_net_annualized_mean": float(g["return_net_annualized"].mean()),
             "max_drawdown_unitless_worst": float(g["max_drawdown_unitless"].min()),
         }
     return out
@@ -470,6 +602,8 @@ def append_experiment_registry(
         row[f"h{horizon_key}_spread_gross"] = metrics.get("decile_spread_gross_mean")
         row[f"h{horizon_key}_spread_net"] = metrics.get("decile_spread_net_mean")
         row[f"h{horizon_key}_turnover"] = metrics.get("turnover_mean")
+        row[f"h{horizon_key}_ret_gross_ann"] = metrics.get("return_gross_annualized_mean")
+        row[f"h{horizon_key}_ret_net_ann"] = metrics.get("return_net_annualized_mean")
         row[f"h{horizon_key}_mdd"] = metrics.get("max_drawdown_unitless_worst")
         row[f"h{horizon_key}_hit_rate"] = metrics.get("hit_rate_mean")
         row[f"h{horizon_key}_rmse"] = metrics.get("rmse_mean")
@@ -502,9 +636,13 @@ def main() -> None:
     parser.add_argument("--n-splits", type=int, default=5, help="Walk-forward fold count")
     parser.add_argument(
         "--feature-mode",
-        choices=["all", "core"],
-        default="all",
-        help="'all' = all normalized features, 'core' = only return-family core set",
+        choices=["all_numeric", "normalized", "all", "core"],
+        default="all_numeric",
+        help=(
+            "'all_numeric' = all numeric lagged features (best full-system mode), "
+            "'normalized'/'all' = normalized-only features, "
+            "'core' = return-family core set"
+        ),
     )
     parser.add_argument(
         "--include-prefix",
@@ -629,8 +767,9 @@ def main() -> None:
         print(
             f"Folds={len(fold_frame)} | "
             f"IC={fold_frame['spearman_ic_mean'].mean():+.4f} | "
-            f"SpreadNet={fold_frame['decile_spread_net'].mean():+.5f} | "
-            f"MDD={fold_frame['max_drawdown_unitless'].min():+.2%}"
+            f"RetNetAnn={fold_frame['return_net_annualized'].mean():+.2%} | "
+            f"MDD={fold_frame['max_drawdown_unitless'].min():+.2%} | "
+            f"SpreadNet={fold_frame['decile_spread_net'].mean():+.5f}"
         )
 
     fold_metrics = pd.DataFrame(all_fold_rows)

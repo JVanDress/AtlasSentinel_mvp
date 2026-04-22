@@ -1,0 +1,1071 @@
+"""
+Quintic Labs — Predictive Probability Forecast Model
+
+Production-grade XGBoost pipeline for forecasting the probability of
+stocks hitting return thresholds over 20/60/90 day horizons.
+
+Built for institutional capital deployment ($300M+):
+    - Purged walk-forward CV prevents label leakage across horizons
+    - Early stopping prevents overfitting per target
+    - Incomplete data is excluded, not silently patched
+    - Confidence derived from ensemble variance across temporal folds
+    - Walk-forward performance reported by period for regime analysis
+
+Usage:
+    python baseline_study.py -i normalized.parquet -o reports/
+    python baseline_study.py -i normalized.parquet -o reports/ --calibrate
+
+Requirements:
+    pip install pandas pyarrow numpy scipy xgboost scikit-learn matplotlib
+"""
+
+import argparse
+import base64
+import io
+import json
+import pickle
+import sys
+import time
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import numpy as np
+import pandas as pd
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+import xgboost as xgb
+
+
+plt.rcParams.update({
+    "figure.facecolor": "#0e1117",
+    "axes.facecolor": "#161b22",
+    "axes.edgecolor": "#30363d",
+    "axes.labelcolor": "#c9d1d9",
+    "text.color": "#c9d1d9",
+    "xtick.color": "#8b949e",
+    "ytick.color": "#8b949e",
+    "grid.color": "#21262d",
+    "figure.dpi": 120,
+    "font.size": 10,
+})
+
+
+# ===================================================================
+# Configuration
+# ===================================================================
+@dataclass
+class ModelConfig:
+    horizons: list = field(default_factory=lambda: [20, 60, 90])
+    upside_thresholds: list = field(default_factory=lambda: [0.05, 0.08])
+    downside_thresholds: list = field(default_factory=lambda: [0.05, 0.08])
+
+    # Walk-forward settings
+    min_train_days: int = 504         # ~2 years minimum training
+    validation_window_days: int = 63  # ~3 months per fold
+    embargo_days: int = 5             # buffer after purge
+
+    # XGBoost — conservative regularization
+    xgb_base_params: dict = field(default_factory=lambda: {
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "tree_method": "hist",
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbosity": 0,
+    })
+
+    # Per-horizon parameter adjustments
+    # Shorter horizons need more regularization (noisier signal)
+    xgb_horizon_params: dict = field(default_factory=lambda: {
+        20: {"max_depth": 4, "learning_rate": 0.03, "min_child_weight": 100,
+             "subsample": 0.7, "colsample_bytree": 0.7,
+             "reg_alpha": 0.5, "reg_lambda": 2.0},
+        60: {"max_depth": 5, "learning_rate": 0.04, "min_child_weight": 75,
+             "subsample": 0.75, "colsample_bytree": 0.75,
+             "reg_alpha": 0.3, "reg_lambda": 1.5},
+        90: {"max_depth": 6, "learning_rate": 0.05, "min_child_weight": 50,
+             "subsample": 0.8, "colsample_bytree": 0.8,
+             "reg_alpha": 0.1, "reg_lambda": 1.0},
+    })
+
+    # Early stopping
+    early_stopping_rounds: int = 30
+    max_boosting_rounds: int = 800
+
+    # Calibration
+    calibrate: bool = False
+    calibration_method: str = "isotonic"
+
+    # Data quality
+    min_feature_completeness: float = 0.85  # require 85% non-NaN features
+    min_obs_per_target: int = 5000
+
+    confidence_level: float = 0.95
+    feature_cols: list = field(default_factory=list)
+
+
+# ===================================================================
+# Feature engineering
+# ===================================================================
+def build_feature_set(df: pd.DataFrame) -> list:
+    """Identify feature columns. No forward-looking columns allowed."""
+    features = []
+
+    # Trailing z-scores only
+    features += [c for c in df.columns if c.endswith("_zscore")
+                 and not c.startswith("fwd_")]
+
+    # Trailing percentile ranks only
+    features += [c for c in df.columns if c.endswith("_pctrank")
+                 and not c.startswith("fwd_")]
+
+    # Conditioning variables
+    for c in ["vol_22d_lagged", "vol_22d_lagged_ann", "adv_22d_lagged", "mkt_cap"]:
+        if c in df.columns:
+            features.append(c)
+
+    # Raw trailing returns
+    features += [c for c in df.columns if c.startswith("ret_")
+                 and not c.endswith("_zscore") and not c.endswith("_pctrank")
+                 and "fwd" not in c]
+
+    # Categorical codes
+    for c in ["sector_code", "industry_code"]:
+        if c in df.columns:
+            features.append(c)
+
+    # Final safety check — remove anything forward-looking
+    features = [f for f in features if "fwd" not in f]
+
+    return list(dict.fromkeys(features))
+
+
+def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "sector" in df.columns:
+        df["sector_code"] = df["sector"].astype("category").cat.codes
+    if "industry" in df.columns:
+        df["industry_code"] = df["industry"].astype("category").cat.codes
+    return df
+
+
+# ===================================================================
+# Target construction
+# ===================================================================
+def compute_targets(df: pd.DataFrame, cfg: ModelConfig) -> tuple:
+    print("Computing prediction targets ...")
+    target_cols = []
+
+    for h in cfg.horizons:
+        fwd_col = f"fwd_simple_{h}d"
+        if fwd_col not in df.columns:
+            df[fwd_col] = df.groupby("ticker")["close"].transform(
+                lambda s: s.shift(-h) / s - 1
+            )
+
+        for thresh in cfg.upside_thresholds:
+            t = f"target_up_{int(thresh*100)}pct_{h}d"
+            df[t] = np.where(df[fwd_col].notna(),
+                             (df[fwd_col] >= thresh).astype(int), np.nan)
+            target_cols.append(t)
+
+        for thresh in cfg.downside_thresholds:
+            t = f"target_down_{int(thresh*100)}pct_{h}d"
+            df[t] = np.where(df[fwd_col].notna(),
+                             (df[fwd_col] <= -thresh).astype(int), np.nan)
+            target_cols.append(t)
+
+    for t in target_cols:
+        n = df[t].notna().sum()
+        rate = df[t].mean()
+        print(f"  {t}: {n:,} labeled, {rate*100:.1f}% positive")
+
+    return df, target_cols
+
+
+# ===================================================================
+# Data quality filter
+# ===================================================================
+def filter_by_feature_completeness(
+    df: pd.DataFrame,
+    features: list,
+    min_completeness: float,
+) -> pd.Series:
+    """
+    Returns boolean mask. Stocks with insufficient feature data
+    are excluded from both training and prediction — not patched.
+    """
+    completeness = df[features].notna().mean(axis=1)
+    mask = completeness >= min_completeness
+    n_excluded = (~mask).sum()
+    pct = n_excluded / len(df) * 100
+    print(f"  Feature completeness filter: {n_excluded:,} rows excluded ({pct:.1f}%)")
+    print(f"  Minimum required: {min_completeness*100:.0f}% non-NaN features")
+    return mask
+
+
+# ===================================================================
+# Purged walk-forward cross-validation
+# ===================================================================
+class PurgedWalkForwardCV:
+    """
+    Walk-forward CV with purging to prevent label leakage.
+
+    For a target with horizon H:
+    - Training uses dates [0, T]
+    - Purge zone: remove training labels from [T - H - embargo, T]
+      because those labels use price information from the validation period
+    - Validation uses dates [T + 1, T + val_window]
+    - Step forward by val_window and repeat
+
+    This ensures no training label contains information about any date
+    in the validation set.
+    """
+
+    def __init__(self, dates: np.ndarray, horizon: int, min_train: int,
+                 val_window: int, embargo: int):
+        self.dates = np.sort(np.unique(dates))
+        self.horizon = horizon
+        self.min_train = min_train
+        self.val_window = val_window
+        self.embargo = embargo
+
+    def split(self):
+        """Yields (train_dates, val_dates, early_stop_dates) tuples."""
+        n = len(self.dates)
+        purge_size = self.horizon + self.embargo
+
+        # First split starts after min_train days
+        start = self.min_train
+
+        folds = []
+        while start + self.val_window <= n:
+            val_start = start
+            val_end = min(start + self.val_window, n)
+
+            # Training dates: everything before val_start, minus purge zone
+            train_end = val_start - purge_size
+            if train_end < self.min_train // 2:
+                start += self.val_window
+                continue
+
+            train_dates = self.dates[:train_end]
+            val_dates = self.dates[val_start:val_end]
+
+            # Early stopping holdout: last 20% of training before purge
+            es_split = int(len(train_dates) * 0.8)
+            es_dates = train_dates[es_split:]
+            train_dates_final = train_dates[:es_split]
+
+            folds.append((train_dates_final, val_dates, es_dates))
+            start += self.val_window
+
+        return folds
+
+    def n_folds(self):
+        return len(self.split())
+
+
+# ===================================================================
+# Model training
+# ===================================================================
+def get_params_for_target(target_col: str, cfg: ModelConfig) -> dict:
+    """Get XGBoost parameters tuned for the specific horizon."""
+    params = cfg.xgb_base_params.copy()
+
+    # Extract horizon from target name
+    parts = target_col.split("_")
+    horizon_str = parts[-1]  # e.g. "20d"
+    horizon = int(horizon_str.replace("d", ""))
+
+    if horizon in cfg.xgb_horizon_params:
+        params.update(cfg.xgb_horizon_params[horizon])
+    else:
+        # Fall back to closest horizon
+        closest = min(cfg.xgb_horizon_params.keys(),
+                      key=lambda k: abs(k - horizon))
+        params.update(cfg.xgb_horizon_params[closest])
+
+    return params
+
+
+def train_model(
+    train_df: pd.DataFrame,
+    features: list,
+    target_col: str,
+    cfg: ModelConfig,
+) -> dict:
+    """
+    Train XGBoost with purged walk-forward CV and proper early stopping.
+    Returns model, fold models (for ensemble), and diagnostics.
+    """
+    # Extract horizon for purge calculation
+    parts = target_col.split("_")
+    horizon = int(parts[-1].replace("d", ""))
+
+    # Filter to rows with valid target AND sufficient features
+    valid = train_df[target_col].notna() & train_df["_feat_complete"]
+    work = train_df[valid].copy()
+
+    X_all = work[features].values
+    y_all = work[target_col].values
+    dates_all = work["date"].values
+
+    pos_rate = y_all.mean()
+    neg_rate = 1 - pos_rate
+    scale_pos = neg_rate / pos_rate if pos_rate > 0 else 1.0
+
+    params = get_params_for_target(target_col, cfg)
+    params["scale_pos_weight"] = scale_pos
+
+    # Build walk-forward splits with purging
+    cv = PurgedWalkForwardCV(
+        dates=dates_all,
+        horizon=horizon,
+        min_train=cfg.min_train_days,
+        val_window=cfg.validation_window_days,
+        embargo=cfg.embargo_days,
+    )
+
+    folds = cv.split()
+    if len(folds) == 0:
+        print(f"    WARNING: No valid CV folds for {target_col}")
+        return None
+
+    print(f"    Horizon: {horizon}d | Purge: {horizon + cfg.embargo_days}d | "
+          f"Folds: {len(folds)}")
+
+    fold_models = []
+    fold_results = []
+
+    for fold_idx, (train_dates, val_dates, es_dates) in enumerate(folds):
+        train_mask = np.isin(dates_all, train_dates)
+        val_mask = np.isin(dates_all, val_dates)
+        es_mask = np.isin(dates_all, es_dates)
+
+        X_tr, y_tr = X_all[train_mask], y_all[train_mask]
+        X_val, y_val = X_all[val_mask], y_all[val_mask]
+        X_es, y_es = X_all[es_mask], y_all[es_mask]
+
+        if len(np.unique(y_tr)) < 2 or len(np.unique(y_val)) < 2:
+            continue
+        if len(X_es) < 50:
+            # Not enough early stopping data, use val as eval set
+            X_es, y_es = X_val, y_val
+
+        model = xgb.XGBClassifier(
+            n_estimators=cfg.max_boosting_rounds,
+            early_stopping_rounds=cfg.early_stopping_rounds,
+            **params,
+        )
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_es, y_es)],
+            verbose=False,
+        )
+
+        val_probs = model.predict_proba(X_val)[:, 1]
+
+        try:
+            auc = roc_auc_score(y_val, val_probs)
+            brier = brier_score_loss(y_val, val_probs)
+            ll = log_loss(y_val, val_probs)
+
+            val_start = val_dates[0]
+            val_end = val_dates[-1]
+
+            fold_results.append({
+                "fold": fold_idx,
+                "val_start": str(pd.Timestamp(val_start).date()),
+                "val_end": str(pd.Timestamp(val_end).date()),
+                "auc": auc,
+                "brier": brier,
+                "logloss": ll,
+                "n_train": int(train_mask.sum()),
+                "n_val": int(val_mask.sum()),
+                "best_iteration": model.best_iteration if hasattr(model, "best_iteration") else cfg.max_boosting_rounds,
+                "pos_rate_train": float(y_tr.mean()),
+                "pos_rate_val": float(y_val.mean()),
+            })
+
+            fold_models.append(model)
+        except Exception as e:
+            print(f"    Fold {fold_idx} error: {e}")
+            continue
+
+    if not fold_results:
+        print(f"    No valid fold results for {target_col}")
+        return None
+
+    # Train final model on all data with early stopping on last chunk
+    final_es_split = int(len(X_all) * 0.85)
+    X_final_tr = X_all[:final_es_split]
+    y_final_tr = y_all[:final_es_split]
+    X_final_es = X_all[final_es_split:]
+    y_final_es = y_all[final_es_split:]
+
+    final_model = xgb.XGBClassifier(
+        n_estimators=cfg.max_boosting_rounds,
+        early_stopping_rounds=cfg.early_stopping_rounds,
+        **params,
+    )
+    final_model.fit(
+        X_final_tr, y_final_tr,
+        eval_set=[(X_final_es, y_final_es)],
+        verbose=False,
+    )
+
+    # Feature importance
+    importance = dict(zip(features, final_model.feature_importances_))
+    importance = dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+
+    # Summary stats
+    aucs = [r["auc"] for r in fold_results]
+    briers = [r["brier"] for r in fold_results]
+
+    print(f"    AUC: {np.mean(aucs):.4f} +/- {np.std(aucs):.4f} | "
+          f"Brier: {np.mean(briers):.4f} +/- {np.std(briers):.4f} | "
+          f"Pos rate: {pos_rate*100:.1f}% | n={len(y_all):,}")
+
+    # Per-fold breakdown
+    for r in fold_results:
+        print(f"      Fold {r['fold']}: {r['val_start']} -> {r['val_end']} | "
+              f"AUC={r['auc']:.4f} | Brier={r['brier']:.4f} | "
+              f"n_val={r['n_val']:,} | rounds={r['best_iteration']}")
+
+    return {
+        "final_model": final_model,
+        "fold_models": fold_models,
+        "features": features,
+        "target": target_col,
+        "fold_results": fold_results,
+        "pos_rate": pos_rate,
+        "n_train": len(y_all),
+        "importance": importance,
+        "params": params,
+    }
+
+
+# ===================================================================
+# Prediction with ensemble uncertainty
+# ===================================================================
+def predict_with_uncertainty(
+    predict_df: pd.DataFrame,
+    model_result: dict,
+    cfg: ModelConfig,
+) -> tuple:
+    """
+    Generate predictions using the ensemble of walk-forward models.
+    Returns (mean_probability, confidence_score).
+
+    Confidence is derived from agreement across temporal folds:
+    - If all folds agree on a probability, confidence is high
+    - If folds disagree, the signal is unstable across regimes
+    """
+    features = model_result["features"]
+    fold_models = model_result["fold_models"]
+    final_model = model_result["final_model"]
+
+    X = predict_df[features].copy()
+
+    # Identify rows with sufficient feature completeness
+    completeness = X.notna().mean(axis=1)
+    scoreable = completeness >= cfg.min_feature_completeness
+
+    # For scoreable rows, fill remaining NaNs with column median
+    # (only for the small % of features that are missing on otherwise complete rows)
+    X_clean = X[scoreable].copy()
+    for c in features:
+        if c in X_clean.columns and X_clean[c].isna().any():
+            X_clean[c] = X_clean[c].fillna(X_clean[c].median())
+
+    # Ensemble predictions from all fold models + final model
+    all_probs = []
+
+    for model in fold_models:
+        try:
+            probs = model.predict_proba(X_clean.values)[:, 1]
+            all_probs.append(probs)
+        except Exception:
+            continue
+
+    # Always include final model
+    try:
+        final_probs = final_model.predict_proba(X_clean.values)[:, 1]
+        all_probs.append(final_probs)
+    except Exception:
+        pass
+
+    if not all_probs:
+        return (np.full(len(predict_df), np.nan),
+                np.full(len(predict_df), np.nan))
+
+    prob_matrix = np.column_stack(all_probs)
+
+    # Mean probability across ensemble
+    mean_probs = prob_matrix.mean(axis=1)
+
+    # Confidence: inverse of ensemble disagreement
+    if prob_matrix.shape[1] >= 2:
+        ensemble_std = prob_matrix.std(axis=1)
+        # Normalize: std of 0 = perfect agreement = confidence 1.0
+        # std of 0.25 (max for binary) = zero confidence
+        raw_confidence = 1.0 - (ensemble_std / 0.25)
+        raw_confidence = np.clip(raw_confidence, 0, 1)
+
+        # Weight by feature completeness
+        feat_comp = completeness[scoreable].values
+        confidence = raw_confidence * 0.7 + feat_comp * 0.3
+    else:
+        # Single model — confidence based on feature completeness only
+        confidence = completeness[scoreable].values * 0.8
+
+    # Calibration (optional)
+    if cfg.calibrate and "calibrator" in model_result and model_result["calibrator"] is not None:
+        mean_probs = model_result["calibrator"].predict(mean_probs)
+        mean_probs = np.clip(mean_probs, 0, 1)
+
+    # Map back to full dataframe shape
+    full_probs = np.full(len(predict_df), np.nan)
+    full_confidence = np.full(len(predict_df), np.nan)
+    full_probs[scoreable.values] = mean_probs
+    full_confidence[scoreable.values] = confidence
+
+    n_scored = scoreable.sum()
+    n_excluded = (~scoreable).sum()
+    if n_excluded > 0:
+        print(f"    {n_scored:,} scored, {n_excluded:,} excluded (insufficient features)")
+
+    return full_probs, full_confidence
+
+
+# ===================================================================
+# Calibration (optional, run after baseline)
+# ===================================================================
+def fit_calibrator(model_result: dict, train_df: pd.DataFrame, cfg: ModelConfig):
+    """
+    Fit isotonic calibration using out-of-fold predictions from
+    walk-forward CV. Only call when --calibrate is passed.
+    """
+    features = model_result["features"]
+    target = model_result["target"]
+    fold_models = model_result["fold_models"]
+    fold_results = model_result["fold_results"]
+
+    parts = target.split("_")
+    horizon = int(parts[-1].replace("d", ""))
+
+    valid = train_df[target].notna() & train_df["_feat_complete"]
+    work = train_df[valid].copy()
+    dates_all = work["date"].values
+
+    cv = PurgedWalkForwardCV(
+        dates=dates_all,
+        horizon=horizon,
+        min_train=cfg.min_train_days,
+        val_window=cfg.validation_window_days,
+        embargo=cfg.embargo_days,
+    )
+
+    folds = cv.split()
+    oof_probs = []
+    oof_labels = []
+
+    X_all = work[features].values
+    y_all = work[target].values
+
+    for fold_idx, (_, val_dates, _) in enumerate(folds):
+        if fold_idx >= len(fold_models):
+            break
+
+        val_mask = np.isin(dates_all, val_dates)
+        X_val = X_all[val_mask]
+        y_val = y_all[val_mask]
+
+        probs = fold_models[fold_idx].predict_proba(X_val)[:, 1]
+        oof_probs.extend(probs)
+        oof_labels.extend(y_val)
+
+    if len(oof_probs) < 100:
+        model_result["calibrator"] = None
+        return
+
+    from sklearn.isotonic import IsotonicRegression
+
+    oof_probs = np.array(oof_probs)
+    oof_labels = np.array(oof_labels)
+
+    if cfg.calibration_method == "isotonic":
+        cal = IsotonicRegression(out_of_bounds="clip")
+    else:
+        from sklearn.linear_model import LogisticRegression
+        cal = LogisticRegression()
+
+    cal.fit(oof_probs, oof_labels)
+    model_result["calibrator"] = cal
+    print(f"    Calibrator fitted on {len(oof_probs):,} out-of-fold predictions")
+
+
+# ===================================================================
+# HTML report
+# ===================================================================
+def fig_to_base64(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+def make_walkforward_chart(model_results: dict) -> str:
+    """AUC by fold over time for each target."""
+    targets = list(model_results.keys())
+    n = len(targets)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows))
+    axes_flat = np.array(axes).flatten() if n > 1 else [axes]
+
+    for i, target in enumerate(targets):
+        ax = axes_flat[i]
+        result = model_results[target]
+        if result is None:
+            continue
+
+        folds = result["fold_results"]
+        x_labels = [f"{r['val_start']}" for r in folds]
+        aucs = [r["auc"] for r in folds]
+
+        color = "#238636" if "up" in target else "#da3633"
+        ax.bar(range(len(aucs)), aucs, color=color, alpha=0.75)
+        ax.axhline(0.5, color="#8b949e", linestyle="--", alpha=0.5)
+        ax.axhline(np.mean(aucs), color="#f0f6fc", linestyle="-", linewidth=1,
+                   label=f"Mean: {np.mean(aucs):.3f}")
+
+        ax.set_xticks(range(len(x_labels)))
+        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=7)
+        ax.set_ylabel("AUC")
+        ax.set_ylim(0.4, max(0.75, max(aucs) + 0.05))
+
+        short_name = target.replace("target_", "")
+        ax.set_title(short_name, fontweight="bold", fontsize=9)
+        ax.legend(fontsize=7)
+        ax.grid(axis="y", alpha=0.3)
+
+    for j in range(i + 1, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle("Walk-Forward AUC by Validation Period (Purged)",
+                 fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
+def make_feature_importance_chart(model_results: dict) -> str:
+    combined = {}
+    for key, result in model_results.items():
+        if result is None:
+            continue
+        for feat, imp in result["importance"].items():
+            if feat not in combined:
+                combined[feat] = []
+            combined[feat].append(imp)
+
+    avg = {k: np.mean(v) for k, v in combined.items()}
+    top_20 = dict(sorted(avg.items(), key=lambda x: x[1], reverse=True)[:20])
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    y = range(len(top_20))
+    ax.barh(y, list(top_20.values()), color="#1f6feb", alpha=0.85)
+    ax.set_yticks(y)
+    ax.set_yticklabels(list(top_20.keys()), fontsize=8)
+    ax.set_xlabel("Avg Feature Importance")
+    ax.set_title("Top 20 Features", fontweight="bold")
+    ax.grid(axis="x", alpha=0.3)
+    ax.invert_yaxis()
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
+def make_prediction_dist_chart(predictions: pd.DataFrame, prob_cols: list) -> str:
+    n = min(6, len(prob_cols))
+    cols = 3
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(16, 4 * rows))
+    axes_flat = np.array(axes).flatten()
+
+    for i, col in enumerate(prob_cols[:n]):
+        ax = axes_flat[i]
+        data = predictions[col].dropna()
+        if data.empty:
+            continue
+        color = "#238636" if "up" in col else "#da3633"
+        ax.hist(data, bins=50, color=color, alpha=0.7, edgecolor="none")
+        ax.axvline(data.median(), color="#f0f6fc", linestyle="--", linewidth=1)
+        ax.set_xlabel("Probability")
+        ax.set_title(col.replace("prob_", ""), fontweight="bold", fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+
+    for j in range(n, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle("Prediction Distributions", fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
+def make_top_stocks_table(predictions: pd.DataFrame, prob_col: str,
+                           conf_col: str, n: int = 20) -> str:
+    show_cols = ["ticker", "sector", "close", "mkt_cap"]
+    show_cols = [c for c in show_cols if c in predictions.columns]
+    show_cols += [prob_col, conf_col]
+
+    top = predictions.dropna(subset=[prob_col]).nlargest(n, prob_col)[show_cols].copy()
+    top[prob_col] = (top[prob_col] * 100).round(2).astype(str) + "%"
+    top[conf_col] = (top[conf_col] * 100).round(1).astype(str) + "%"
+    if "mkt_cap" in top.columns:
+        top["mkt_cap"] = (top["mkt_cap"] / 1e9).round(2).astype(str) + "B"
+    if "close" in top.columns:
+        top["close"] = top["close"].round(2)
+
+    header_map = {
+        "ticker": "Ticker", "sector": "Sector", "close": "Price",
+        "mkt_cap": "Mkt Cap", prob_col: "Probability", conf_col: "Confidence"
+    }
+    headers = "".join(f"<th>{header_map.get(c, c)}</th>" for c in show_cols)
+    rows = ""
+    for _, row in top.iterrows():
+        cells = "".join(f"<td>{row[c]}</td>" for c in show_cols)
+        rows += f"<tr>{cells}</tr>\n"
+
+    return f"<table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table>"
+
+
+def generate_html_report(predictions, model_results, target_configs, cfg, metadata):
+    print("Generating HTML report ...")
+
+    chart_wf = make_walkforward_chart(model_results)
+    chart_fi = make_feature_importance_chart(model_results)
+
+    prob_cols = [tc["prob_col"] for tc in target_configs if tc["prob_col"] in predictions.columns]
+    chart_dist = make_prediction_dist_chart(predictions, prob_cols)
+
+    # Performance table
+    perf_rows = ""
+    for key, result in model_results.items():
+        if result is None:
+            continue
+        folds = result["fold_results"]
+        aucs = [r["auc"] for r in folds]
+        briers = [r["brier"] for r in folds]
+        perf_rows += f"""<tr>
+            <td>{key.replace('target_', '')}</td>
+            <td>{np.mean(aucs):.4f} +/- {np.std(aucs):.4f}</td>
+            <td>{np.mean(briers):.4f} +/- {np.std(briers):.4f}</td>
+            <td>{result['pos_rate']*100:.1f}%</td>
+            <td>{result['n_train']:,}</td>
+            <td>{len(folds)}</td>
+        </tr>"""
+
+    # Top stocks tables
+    top_tables = ""
+    for tc in target_configs:
+        if tc["prob_col"] not in predictions.columns:
+            continue
+        table = make_top_stocks_table(predictions, tc["prob_col"], tc["conf_col"])
+        top_tables += f"<h3>{tc['label']} — Top 20</h3>\n{table}\n"
+
+    pred_date = predictions["date"].max().date() if "date" in predictions.columns else "N/A"
+    n_stocks = predictions["ticker"].nunique() if "ticker" in predictions.columns else 0
+    cal_status = f"{cfg.calibration_method} calibration" if cfg.calibrate else "raw baseline (no calibration)"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Quintic Labs — Probability Forecast</title>
+<style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+        background: #0d1117; color: #c9d1d9;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+        line-height: 1.6; padding: 2rem; max-width: 1200px; margin: 0 auto;
+    }}
+    h1 {{ font-size: 2rem; color: #f0f6fc; border-bottom: 2px solid #238636;
+          padding-bottom: 0.5rem; margin-bottom: 0.5rem; }}
+    .subtitle {{ color: #8b949e; font-size: 0.95rem; margin-bottom: 2rem; }}
+    h2 {{ font-size: 1.4rem; color: #f0f6fc; margin-top: 2.5rem; margin-bottom: 1rem;
+          border-left: 4px solid #238636; padding-left: 0.75rem; }}
+    h3 {{ font-size: 1.05rem; color: #c9d1d9; margin-top: 1.5rem; margin-bottom: 0.5rem; }}
+    p {{ margin-bottom: 1rem; color: #8b949e; }}
+    .meta-box {{
+        background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+        padding: 1rem 1.5rem; margin-bottom: 2rem;
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.5rem;
+    }}
+    .meta-item {{ font-size: 0.9rem; }}
+    .meta-item strong {{ color: #f0f6fc; }}
+    .chart-container {{
+        background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+        padding: 1rem; margin-bottom: 1.5rem; text-align: center;
+    }}
+    .chart-container img {{ max-width: 100%; height: auto; }}
+    table {{ width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; font-size: 0.85rem; }}
+    th {{ background: #161b22; color: #f0f6fc; padding: 0.6rem 0.8rem;
+          text-align: left; border-bottom: 2px solid #30363d; }}
+    td {{ padding: 0.5rem 0.8rem; border-bottom: 1px solid #21262d; }}
+    tr:hover td {{ background: #1c2128; }}
+    .callout {{
+        background: #1c2128; border: 1px solid #30363d; border-left: 4px solid #1f6feb;
+        border-radius: 4px; padding: 1rem; margin: 1rem 0; font-size: 0.9rem;
+    }}
+    .footer {{ margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #21262d;
+               color: #484f58; font-size: 0.8rem; }}
+</style>
+</head>
+<body>
+
+<h1>Quintic Labs — Probability Forecast</h1>
+<p class="subtitle">Forward-looking predictions as of {pred_date} | {cal_status}</p>
+
+<div class="meta-box">
+    <div class="meta-item"><strong>Prediction Date:</strong> {pred_date}</div>
+    <div class="meta-item"><strong>Stocks Scored:</strong> {n_stocks}</div>
+    <div class="meta-item"><strong>Training Rows:</strong> {metadata.get('n_train', '?'):,}</div>
+    <div class="meta-item"><strong>Horizons:</strong> {', '.join(str(h) + 'd' for h in cfg.horizons)}</div>
+    <div class="meta-item"><strong>Thresholds:</strong> +/-{', '.join(str(int(t*100)) + '%' for t in cfg.upside_thresholds)}</div>
+    <div class="meta-item"><strong>Mode:</strong> {cal_status}</div>
+    <div class="meta-item"><strong>Purge:</strong> horizon + {cfg.embargo_days}d embargo</div>
+    <div class="meta-item"><strong>Generated:</strong> {metadata.get('timestamp', '?')}</div>
+</div>
+
+<h2>1. Walk-Forward Model Performance (Purged CV)</h2>
+<p>Each fold trains on historical data, purges labels that overlap with the validation window, and evaluates on unseen future data. AUC above 0.5 indicates the model has predictive signal. Consistency across folds indicates regime stability.</p>
+<table>
+    <thead><tr><th>Target</th><th>AUC (mean +/- std)</th><th>Brier (mean +/- std)</th><th>Pos Rate</th><th>Train Obs</th><th>Folds</th></tr></thead>
+    <tbody>{perf_rows}</tbody>
+</table>
+<div class="chart-container">
+    <img src="data:image/png;base64,{chart_wf}" alt="Walk-forward AUC">
+</div>
+
+<h2>2. Feature Importance</h2>
+<div class="chart-container">
+    <img src="data:image/png;base64,{chart_fi}" alt="Feature importance">
+</div>
+
+<h2>3. Prediction Distributions</h2>
+<p>How predicted probabilities are distributed across today's universe.</p>
+<div class="chart-container">
+    <img src="data:image/png;base64,{chart_dist}" alt="Distributions">
+</div>
+
+<h2>4. Top Stocks by Predicted Probability</h2>
+{top_tables}
+
+<div class="callout">
+    <strong>Confidence scores</strong> reflect ensemble agreement across temporal folds. High confidence means all walk-forward models agree on the probability. Low confidence means the prediction is unstable across market regimes — reduce position sizing accordingly.
+</div>
+
+<div class="footer">Quintic Labs | {cal_status}</div>
+</body></html>"""
+
+    return html
+
+
+# ===================================================================
+# Main
+# ===================================================================
+def main():
+    parser = argparse.ArgumentParser(description="Quintic Labs — Probability Forecast")
+    parser.add_argument("--input", "-i", required=True)
+    parser.add_argument("--output-dir", "-o", default=None)
+    parser.add_argument("--horizons", nargs="+", type=int, default=[20, 60, 90])
+    parser.add_argument("--thresholds", nargs="+", type=float, default=[0.05, 0.08])
+    parser.add_argument("--model-dir", default=None)
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Enable calibration (run baseline first without this)")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        sys.exit(f"Error: file not found: {input_path}")
+
+    output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(args.model_dir) if args.model_dir else output_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = ModelConfig()
+    cfg.horizons = args.horizons
+    cfg.upside_thresholds = args.thresholds
+    cfg.downside_thresholds = args.thresholds
+    cfg.calibrate = args.calibrate
+
+    t_start = time.time()
+
+    # Load
+    print(f"Reading {input_path} ...")
+    df = pd.read_parquet(input_path)
+    print(f"  {len(df):,} rows, {df['ticker'].nunique()} tickers")
+
+    if "in_universe" not in df.columns:
+        df["in_universe"] = True
+
+    # Encode categoricals
+    df = encode_categoricals(df)
+
+    # Build features
+    features = build_feature_set(df)
+    print(f"\nFeatures ({len(features)}):")
+    for f in features[:10]:
+        print(f"  {f}")
+    if len(features) > 10:
+        print(f"  ... and {len(features) - 10} more")
+
+    # Feature completeness filter
+    print("\nData quality:")
+    df["_feat_complete"] = filter_by_feature_completeness(
+        df, features, cfg.min_feature_completeness
+    )
+
+    # Compute targets
+    df, target_cols = compute_targets(df, cfg)
+
+    # Split train/predict
+    # Training: rows where we know outcomes AND in universe AND features complete
+    train_mask = df["in_universe"] & df["_feat_complete"]
+    for t in target_cols:
+        train_mask &= df[t].notna()
+    train_df = df[train_mask].copy()
+
+    # Predict: most recent rows where at least one target is unknown
+    predict_mask = df["in_universe"] & df[target_cols].isna().any(axis=1)
+    predict_df = df[predict_mask].copy()
+
+    # Latest date only for the report predictions
+    latest_date = predict_df["date"].max()
+    latest_df = predict_df[predict_df["date"] == latest_date].copy()
+
+    print(f"\nTrain: {len(train_df):,} rows | "
+          f"{train_df['date'].min().date()} -> {train_df['date'].max().date()}")
+    print(f"Predict: {len(predict_df):,} rows | "
+          f"{predict_df['date'].min().date()} -> {predict_df['date'].max().date()}")
+    print(f"Latest date: {latest_date.date()} | {len(latest_df)} stocks")
+
+    # Train models
+    print(f"\n{'='*60}")
+    print("TRAINING MODELS (Purged Walk-Forward)")
+    print(f"{'='*60}")
+
+    model_results = {}
+    target_configs = []
+
+    for target in target_cols:
+        parts = target.split("_")
+        direction = parts[1]
+        threshold = parts[2]
+        horizon = parts[3]
+        label = f"{'Upside' if direction == 'up' else 'Downside'} +{threshold} {horizon}"
+
+        prob_col = f"prob_{direction}_{threshold}_{horizon}"
+        conf_col = f"conf_{direction}_{threshold}_{horizon}"
+
+        print(f"\n  {label}")
+        result = train_model(train_df, features, target, cfg)
+        model_results[target] = result
+
+        if result is not None and cfg.calibrate:
+            fit_calibrator(result, train_df, cfg)
+
+        target_configs.append({
+            "target": target, "label": label,
+            "prob_col": prob_col, "conf_col": conf_col,
+        })
+
+        # Save model
+        if result is not None:
+            with open(model_dir / f"{target}.pkl", "wb") as f:
+                pickle.dump(result, f)
+
+    # Generate predictions
+    print(f"\n{'='*60}")
+    print("GENERATING PREDICTIONS")
+    print(f"{'='*60}")
+
+    for tc in target_configs:
+        result = model_results[tc["target"]]
+        if result is None:
+            latest_df[tc["prob_col"]] = np.nan
+            latest_df[tc["conf_col"]] = np.nan
+            continue
+
+        print(f"\n  {tc['label']}:")
+        probs, confidence = predict_with_uncertainty(latest_df, result, cfg)
+        latest_df[tc["prob_col"]] = probs
+        latest_df[tc["conf_col"]] = confidence
+
+        valid = ~np.isnan(probs)
+        if valid.any():
+            print(f"    Median prob: {np.nanmedian(probs)*100:.1f}% | "
+                  f"Median conf: {np.nanmedian(confidence)*100:.1f}%")
+
+    # Save predictions
+    id_cols = ["ticker", "date", "close", "sector", "industry", "mkt_cap"]
+    id_cols = [c for c in id_cols if c in latest_df.columns]
+    prob_cols = [tc["prob_col"] for tc in target_configs]
+    conf_cols = [tc["conf_col"] for tc in target_configs]
+    out_cols = id_cols + prob_cols + conf_cols
+
+    output_df = latest_df[out_cols].copy()
+    pred_path = output_dir / "forecast_probabilities.parquet"
+    output_df.to_parquet(pred_path, index=False, engine="pyarrow")
+    print(f"\nSaved: {pred_path} ({len(output_df):,} rows x {len(output_df.columns)} cols)")
+
+    # HTML report
+    metadata = {
+        "n_train": len(train_df),
+        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    html = generate_html_report(latest_df, model_results, target_configs, cfg, metadata)
+    html_path = output_dir / "forecast_report.html"
+    html_path.write_text(html, encoding="utf-8")
+    print(f"Saved: {html_path}")
+
+    # Model metadata
+    meta = {}
+    for key, result in model_results.items():
+        if result is None:
+            continue
+        folds = result["fold_results"]
+        meta[key] = {
+            "cv_auc": [r["auc"] for r in folds],
+            "cv_brier": [r["brier"] for r in folds],
+            "pos_rate": float(result["pos_rate"]),
+            "n_train": int(result["n_train"]),
+            "top_features": dict(list(result["importance"].items())[:10]),
+            "params": {k: v for k, v in result["params"].items()
+                       if not callable(v)},
+        }
+    with open(model_dir / "model_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    total = time.time() - t_start
+
+    print(f"\n{'='*60}")
+    print(f"COMPLETE — {total:.1f}s")
+    print(f"{'='*60}")
+    print(f"  Predictions:  {pred_path}")
+    print(f"  Report:       {html_path}")
+    print(f"  Models:       {model_dir}")
+    cal_str = "ON" if cfg.calibrate else "OFF (baseline)"
+    print(f"  Calibration:  {cal_str}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

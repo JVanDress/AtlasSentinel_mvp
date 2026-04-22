@@ -102,11 +102,15 @@ def validate_numeric_inputs(df: pd.DataFrame) -> None:
 
 
 def winsorize_group(tmp: pd.DataFrame, value_col: str, k: float) -> pd.Series:
-    med = tmp.groupby(["date", "sector"], sort=False)[value_col].transform("median")
-    mad = (tmp[value_col] - med).abs().groupby([tmp["date"], tmp["sector"]]).transform("median")
+    work = tmp[["date", "sector"]].copy()
+    work["value"] = tmp[value_col].astype(np.float64)
+
+    med = work.groupby(["date", "sector"], sort=False)["value"].transform("median")
+    work["abs_dev"] = (work["value"] - med).abs()
+    mad = work.groupby(["date", "sector"], sort=False)["abs_dev"].transform("median")
     lo = med - k * mad
     hi = med + k * mad
-    return tmp[value_col].clip(lower=lo, upper=hi)
+    return work["value"].clip(lower=lo, upper=hi)
 
 
 def zscore_group(tmp: pd.DataFrame, value_col: str, min_count: int) -> pd.Series:
@@ -345,7 +349,9 @@ def main() -> None:
 
     # Cross-sectional normalization
     df, audit_cols, universe_mask, sector_key = normalize_columns(df, base_cols, cfg)
-    grp_sizes = df.loc[universe_mask].groupby([df.loc[universe_mask, "date"], sector_key.loc[universe_mask]]).size()
+    group_frame = df.loc[universe_mask, ["date"]].copy()
+    group_frame["sector"] = sector_key.loc[universe_mask].astype("string")
+    grp_sizes = group_frame.groupby(["date", "sector"], sort=False).size()
     audit_group_sizes = {
         "n_groups": int(len(grp_sizes)),
         "min": int(grp_sizes.min()) if len(grp_sizes) else None,
